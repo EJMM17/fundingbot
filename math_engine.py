@@ -969,7 +969,9 @@ def power_score(
     price_history: np.ndarray,
     volume_24h: float,
     interval_hours: float = 8.0,
-    min_volume: float = 70_000_000.0,
+    min_volume: float = 5_000_000.0,
+    liq_reference: float = 50_000_000.0,
+    entropy_max: float = 0.75,
 ) -> dict[str, float]:
     """
     Score integrado 0.0–1.0 basado en arsenal matemático completo.
@@ -978,6 +980,8 @@ def power_score(
     result: dict[str, float] = {}
 
     # 1. Edge base por funding rate
+    # 0.003 (0.30%) es el FR de saturación del edge: a partir de ahí edge_score=1.0.
+    # Con MAX_FUNDING_RATE=-0.15% el edge base ronda ~0.5 (techo, no umbral).
     edge = abs(funding_rate) / 0.003
     edge_score = min(edge, 1.0)
     result["edge_score"] = edge_score
@@ -1029,8 +1033,11 @@ def power_score(
     if len(fr_history) >= 10:
         h_norm = InformationMetrics.shannon_entropy_normalized(fr_history, bins="fd")
         result["entropy_fr"] = h_norm
-        if h_norm > 0.8:
-            entropy_penalty = (h_norm - 0.8) * 2.5
+        # Penalización alineada con el gate duro (ENTROPY_MAX_ENTRY): por encima
+        # de entropy_max el FR es ruido y el score se castiga (antes hardcodeado 0.8,
+        # dejando muerta la franja 0.75–0.80 que el gate ya cortaba).
+        if h_norm > entropy_max:
+            entropy_penalty = (h_norm - entropy_max) * 2.5
         elif h_norm < 0.4:
             entropy_bonus = 0.15
     result["entropy_penalty"] = entropy_penalty
@@ -1063,8 +1070,8 @@ def power_score(
             result["mf_delta_alpha"] = 0.0
     result["mf_penalty"] = mf_penalty
 
-    # 8. Liquidez (volumen)
-    liq_score = min(volume_24h / (min_volume * 5.0), 1.0)
+    # 8. Liquidez (volumen) — ancla desacoplada del piso de entrada
+    liq_score = min(volume_24h / liq_reference, 1.0)
     result["liq_score"] = liq_score
 
     # 9. Frecuencia

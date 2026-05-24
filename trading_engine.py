@@ -658,7 +658,7 @@ class TradingEngine:
             annualized = abs(ft.annualized_fr_pct)
             fr_score = min(annualized / 200.0, 1.0)
             vol = ticker.get("quoteVolume") or 0.0
-            liq_score = min(vol / (config.MIN_VOLUME_24H * 5), 1.0)
+            liq_score = min(vol / config.VOLUME_LIQ_REFERENCE, 1.0)
             base_score = fr_score * config.SCORE_WEIGHT_FR + liq_score * config.SCORE_WEIGHT_LIQ
             return self._apply_learning_score(symbol, base_score)
 
@@ -686,6 +686,8 @@ class TradingEngine:
                 volume_24h=vol,
                 interval_hours=ft.interval_hours,
                 min_volume=config.MIN_VOLUME_24H,
+                liq_reference=config.VOLUME_LIQ_REFERENCE,
+                entropy_max=config.ENTROPY_MAX_ENTRY,
             )
             state.last_power_score = score_result.get("score", 0.0)
             # Cachear métricas para uso posterior
