@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 
+import config
 import math_engine
 
 logger = logging.getLogger("mc")
@@ -211,13 +212,46 @@ class MonteCarloRiskEngine:
                 tail_penalty = max(0.1, 1.0 + es_95 * 3.0)  # es_95 = -0.10 → penalty = 0.7
             if es_99 < -0.10:
                 tail_penalty *= max(0.1, 1.0 + es_99 * 1.5)
-            kelly_fraction = kelly_raw * tail_penalty * 0.5  # Half-Kelly conservador
+            kelly_fraction = kelly_raw * tail_penalty
         else:
             kelly_fraction = 0.0
 
-        # Tamaño óptimo como % del capital
-        # Limitar a [0, 0.30] (30% máximo del capital en una posición)
-        optimal_size_pct = float(np.clip(kelly_fraction, 0.0, 0.30))
+        # Ajuste dinámico de amplitud basado en ley de potencia/colas
+        amplitude = 1.0
+        powerlaw_alpha = None
+        if len(log_returns) >= 50:
+            try:
+                tail_info = math_engine.PowerLawTail.tail_risk_index(log_returns)
+                powerlaw_alpha = tail_info.get("alpha")
+            except Exception:
+                tail_info = {}
+
+            if powerlaw_alpha is not None and not np.isnan(powerlaw_alpha):
+                if powerlaw_alpha >= 3.5:
+                    amplitude += 0.20
+                elif powerlaw_alpha >= 3.0:
+                    amplitude += 0.10
+                elif powerlaw_alpha < 2.5:
+                    amplitude -= 0.25
+
+        gpd_xi = float(params.get("xi", 0.0) or 0.0)
+        if gpd_xi <= 0.20:
+            amplitude += 0.10
+        elif gpd_xi >= 0.40:
+            amplitude -= 0.20
+
+        amplitude = float(np.clip(amplitude, config.POWERLAW_AMPLITUDE_MIN, config.POWERLAW_AMPLITUDE_MAX))
+
+        if config.POWERLAW_AGGRESSIVE_MODE and prob_ruin <= config.MAX_ALLOWED_PROB_RUIN:
+            kelly_multiplier = config.KELLY_MULTIPLIER_AGGRESSIVE
+            max_position_pct = config.MAX_POSITION_PCT_AGGRESSIVE
+            sizing_mode = "powerlaw_aggressive"
+        else:
+            kelly_multiplier = config.KELLY_MULTIPLIER_BASE
+            max_position_pct = config.MAX_POSITION_PCT_BASE
+            sizing_mode = "base"
+
+        optimal_size_pct = float(np.clip(kelly_fraction * kelly_multiplier * amplitude, 0.0, max_position_pct))
 
         result = {
             "n_paths": self.n_paths,
@@ -231,19 +265,15 @@ class MonteCarloRiskEngine:
             "expected_pnl": expected_pnl,
             "worst_case": worst_case,
             "kelly_fraction": kelly_fraction,
+            "kelly_multiplier": kelly_multiplier,
+            "sizing_mode": sizing_mode,
+            "amplitude_factor": amplitude,
+            "max_position_pct": max_position_pct,
             "optimal_size_pct": optimal_size_pct,
             "gpd_xi": params["xi"],
             "gpd_sigma": params["sigma_gpd"],
-            "powerlaw_alpha": None,
+            "powerlaw_alpha": powerlaw_alpha,
         }
-
-        # Ajustar powerlaw alpha si hay datos suficientes
-        if len(log_returns) >= 50:
-            try:
-                tail_info = math_engine.PowerLawTail.tail_risk_index(log_returns)
-                result["powerlaw_alpha"] = tail_info.get("alpha")
-            except Exception:
-                pass
 
         return result
 
@@ -271,5 +301,5 @@ class MonteCarloRiskEngine:
             **sim,
             "capital": capital,
             "recommended_usdt": recommended_usdt,
-            "max_acceptable_usdt": capital * 0.30,  # hard cap 30%
+            "max_acceptable_usdt": capital * sim["max_position_pct"],
         }

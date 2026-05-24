@@ -123,6 +123,27 @@ sudo systemctl stop fundingbot
 sudo systemctl enable fundingbot
 ```
 
+
+## ¿Corre 24/7 o hay que hacer algo más?
+
+Sí: **ya está diseñado para correr 24/7** en `main.py` mediante un loop infinito controlado por `SCAN_INTERVAL_SECONDS` y con manejo de señales para reinicio/apagado limpio.
+
+Para que sea realmente 24/7 en producción, debes ejecutarlo como servicio `systemd` (paso 6). Eso hace que:
+
+- Se inicie automáticamente con el servidor (`enable`).
+- Se reinicie si el proceso cae (`Restart=always` en el service).
+- Quede monitoreado por logs (`journalctl`).
+
+Validación rápida en servidor:
+
+```bash
+sudo systemctl enable fundingbot
+sudo systemctl start fundingbot
+sudo systemctl status fundingbot --no-pager
+```
+
+Si `status` aparece como `active (running)`, está operando de forma continua.
+
 ## 7. Actualizar Version
 
 ```bash
