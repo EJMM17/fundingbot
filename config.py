@@ -90,20 +90,29 @@ LEVERAGE: int = _env_int("LEVERAGE", 5)
 MARGIN_MODE: str = os.getenv("MARGIN_MODE", "cross")
 
 # ── Escáner ───────────────────────────────────────────────────────
-# Volumen mínimo 24h en USDT para garantizar liquidez real
-MIN_VOLUME_24H: float = 70_000_000.0        # USDT
+# Piso de volumen 24h en USDT. Permisivo a propósito (5M) para operar
+# muchas más altcoins: la liquidez REAL ya no se controla aquí sino vía
+# el spread gate (MAX_SPREAD_PCT) y el score de liquidez (VOLUME_LIQ_REFERENCE).
+MIN_VOLUME_24H: float = 5_000_000.0         # USDT
+
+# Volumen de referencia al que liq_score satura en 1.0. Desacoplado del
+# piso de entrada: aunque MIN_VOLUME_24H baje, el ranking sigue premiando
+# coins gruesas sobre finas (antes estaba atado a MIN_VOLUME_24H * 5).
+VOLUME_LIQ_REFERENCE: float = 50_000_000.0  # USDT
 
 # Umbral de FR para entrada.
 # Lógica económica: fee round-trip KuCoin = 0.12% notional.
-# FR mínimo para ser rentable = 0.12% + margen de slippage (~0.08%).
-# → Umbral conservador: -0.20% (-0.0020)
-# (Más estricto que MEXC porque KuCoin tiene taker fee de 0.06%/lado)
-MAX_FUNDING_RATE: float = -0.0020           # ≤ -0.20%
+# Relajado a -0.15% para ganar flexibilidad en alts de bajo volumen.
+# net_fr_after_fees resta el 0.06% de cierre → 0.15% - 0.06% = 0.09% neto > 0.
+# Margen sobre fees deliberadamente más ajustado (el spread gate cubre el resto).
+MAX_FUNDING_RATE: float = -0.0015           # ≤ -0.15%
 
 # ── Límites de riesgo ─────────────────────────────────────────────
-MAX_MARGIN_PER_COIN: float = _env_float("MAX_MARGIN_PER_COIN", 150.0)  # USDT máximo por moneda
-MAX_TOTAL_MARGIN: float = _env_float("MAX_TOTAL_MARGIN", 500.0)         # USDT máximo en TODAS las posiciones
-MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 5)             # Máximo de posiciones abiertas simultáneas
+# Margen por moneda bajado a 100: con coins de bajo volumen (más riesgo de
+# cola) conviene menos concentración por símbolo y más diversificación.
+MAX_MARGIN_PER_COIN: float = _env_float("MAX_MARGIN_PER_COIN", 100.0)   # USDT máximo por moneda
+MAX_TOTAL_MARGIN: float = _env_float("MAX_TOTAL_MARGIN", 500.0)         # USDT máximo en TODAS las posiciones (capital total acotado)
+MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 8)             # Máximo de posiciones simultáneas (más candidatos al bajar el piso)
 COOLDOWN_SECONDS: int = 60                  # Entre órdenes de la misma moneda
 INITIAL_ENTRY_MARGIN: float = 5.0           # Primera entrada en USDT
 
@@ -151,17 +160,21 @@ ENTRY_WINDOW_MINUTES_MIN: int = 5          # Mínimo absoluto en minutos
 # ── Price drift gate (entrada inicial) ────────────────────────────
 # Máximo desvío aceptable entre el precio del scan y el precio
 # de ejecución. Protege contra entradas en precios stale.
-PRICE_DRIFT_MAX_PCT: float = 0.0030        # 0.30%
+# Relajado a 0.40%: las alts finas se mueven más entre scan y ejecución.
+PRICE_DRIFT_MAX_PCT: float = 0.0040        # 0.40%
 
 # ── Slippage gate (ejecución de órdenes) ──────────────────────────
 # Máximo desvío aceptable entre el precio esperado y el fill real.
-# En volatilidad alta pre-funding el slippage puede comerse el edge.
-MAX_SLIPPAGE_PCT: float = 0.0050           # 0.50%
+# Subido a 0.70%: coins de bajo volumen rellenan con más slippage;
+# se mantiene acotado para no comerse el edge del funding.
+MAX_SLIPPAGE_PCT: float = 0.0070           # 0.70%
 
 # ── Liquidity gate (spread) ───────────────────────────────────────
 # Máximo spread bid-ask aceptable al momento de la entrada.
-# Spread alto = slippage letal en market orders.
-MAX_SPREAD_PCT: float = 0.0010             # 0.10%
+# Subido a 0.15%: con el piso de volumen en 5M, ESTE es el verdadero
+# filtro de liquidez. Trade-off: spread mayor = más coste de slippage
+# en market orders, por eso no se relaja más allá de 0.15%.
+MAX_SPREAD_PCT: float = 0.0015             # 0.15%
 
 # ── Blindfold post-funding (anti-dump) ────────────────────────────
 # Después del snapshot, scalpers cierran masivamente causando un dump.
@@ -187,7 +200,7 @@ EXIT_FUNDING_RATE: float = 0.0             # FR ≥ 0% → cerrar
 # ── Scoring y ranking de oportunidades ────────────────────────────
 # El bot evalúa TODOS los pares que califican y solo entra en las
 # TOP_N mejores según score ponderado.
-TOP_N_OPPORTUNITIES: int = 3               # Máximo de entradas nuevas por ciclo
+TOP_N_OPPORTUNITIES: int = 4               # Máximo de entradas nuevas por ciclo
 SCORE_WEIGHT_FR: float = 0.6               # Peso del funding rate anualizado
 SCORE_WEIGHT_LIQ: float = 0.3              # Peso de la liquidez (volumen normalizado)
 SCORE_WEIGHT_OI: float = 0.1               # Peso de la tendencia de OI
@@ -255,7 +268,10 @@ AUTO_LEARNING_MAX_BOOST: float = _env_float("AUTO_LEARNING_MAX_BOOST", 0.15)
 AUTO_LEARNING_MAX_PENALTY: float = _env_float("AUTO_LEARNING_MAX_PENALTY", 0.40)
 
 # ── Arsenal Matemático ──────────────────────────────────────────────
-MATH_HISTORY_WINDOW: int = 120          # Ventana para históricos
+# Ventana de históricos subida a 150: estimadores de cola (CSN), Hurst-DFA
+# y multifractal (MF-DFA) son más estables con más muestras y se mantiene
+# el mínimo ≥64 del multifractal con margen.
+MATH_HISTORY_WINDOW: int = 150          # Ventana para históricos
 
 # EVT (Extreme Value Theory)
 ENABLE_EVT_STOPS: bool = True           # Usar stops basados en GPD
