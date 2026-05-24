@@ -309,6 +309,19 @@ MULTIFRACTAL_WIDTH_ABORT: float = 0.70      # Δα para abortar entrada
 # Scoring
 ENABLE_MATH_SCORING: bool = True        # Reemplazar scoring simple por power_score
 
+
+# ── Modo agresivo ley de potencia ─────────────────────────────────
+# Permite aumentar amplitud de sizing de forma dinámica y mejorable
+# manteniendo un guardrail de probabilidad de ruina.
+POWERLAW_AGGRESSIVE_MODE: bool = _env_bool("POWERLAW_AGGRESSIVE_MODE", True)
+KELLY_MULTIPLIER_BASE: float = _env_float("KELLY_MULTIPLIER_BASE", 0.50)
+KELLY_MULTIPLIER_AGGRESSIVE: float = _env_float("KELLY_MULTIPLIER_AGGRESSIVE", 1.00)
+MAX_POSITION_PCT_BASE: float = _env_float("MAX_POSITION_PCT_BASE", 0.30)
+MAX_POSITION_PCT_AGGRESSIVE: float = _env_float("MAX_POSITION_PCT_AGGRESSIVE", 0.60)
+MAX_ALLOWED_PROB_RUIN: float = _env_float("MAX_ALLOWED_PROB_RUIN", 0.18)
+POWERLAW_AMPLITUDE_MIN: float = _env_float("POWERLAW_AMPLITUDE_MIN", 0.80)
+POWERLAW_AMPLITUDE_MAX: float = _env_float("POWERLAW_AMPLITUDE_MAX", 1.50)
+
 # ── Heartbeat ─────────────────────────────────────────────────────
 # Intervalo en segundos para loguear heartbeat (estado resumido).
 HEARTBEAT_INTERVAL_SECONDS: int = 300      # 5 minutos
