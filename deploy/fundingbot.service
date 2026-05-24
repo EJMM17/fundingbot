@@ -1,0 +1,25 @@
+[Unit]
+Description=KuCoin Funding Fee Scalper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fundingbot
+Group=fundingbot
+WorkingDirectory=/opt/fundingbot
+ExecStart=/opt/fundingbot/.venv/bin/python -u /opt/fundingbot/main.py
+Restart=always
+RestartSec=15
+TimeoutStopSec=45
+KillSignal=SIGINT
+Environment=PYTHONUNBUFFERED=1
+
+# Basic hardening. The bot still needs write access to bot.db and bot.log.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/fundingbot
+
+[Install]
+WantedBy=multi-user.target
