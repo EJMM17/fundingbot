@@ -37,7 +37,7 @@ import asyncio
 import logging
 import math
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -434,7 +434,7 @@ class TradingEngine:
             await asyncio.sleep(config.RATE_LIMIT_PAUSE)
             bid = ticker.get("bid")
             ask = ticker.get("ask")
-            if bid and ask and bid > 0:
+            if bid and ask and bid > config.FLOAT_EPSILON:
                 spread = (ask - bid) / bid
                 if spread > config.MAX_SPREAD_PCT:
                     logger.info(
@@ -748,6 +748,11 @@ class TradingEngine:
         qualified: list[tuple[str, FundingTiming, float]] = []  # (sym, ft, score)
         lock = asyncio.Lock()
 
+        # Embudo de diagnóstico: cuenta dónde mueren los candidatos por gate.
+        # asyncio es monohilo y no hay await entre leer/escribir el contador,
+        # así que el incremento es seguro sin lock.
+        funnel: Counter = Counter()
+
         async def _check_symbol(symbol: str) -> None:
             async with semaphore:
                 try:
@@ -786,6 +791,7 @@ class TradingEngine:
                                     "MATH GATE BLOCK %s | Tail risk %.2f > 0.7 (α=%.2f). Entrada abortada.",
                                     symbol, tail_info["risk"], tail_info["alpha"]
                                 )
+                                funnel["tail_gate"] += 1
                                 return
                         except Exception as exc:
                             logger.debug("tail_gate skip %s: %s", symbol, exc)
@@ -802,6 +808,7 @@ class TradingEngine:
                                     "MATH GATE BLOCK %s | Entropy %.3f > %.2f (ruido puro). Entrada abortada.",
                                     symbol, h_norm, config.ENTROPY_MAX_ENTRY
                                 )
+                                funnel["entropy_gate"] += 1
                                 return
                         except Exception as exc:
                             logger.debug("entropy_gate skip %s: %s", symbol, exc)
@@ -821,12 +828,18 @@ class TradingEngine:
                                     "MATH GATE BLOCK %s | Δα %.3f > %.2f (multifractalidad extrema). Entrada abortada.",
                                     symbol, delta_alpha, config.MULTIFRACTAL_WIDTH_ABORT
                                 )
+                                funnel["mf_gate"] += 1
                                 return
                         except Exception as exc:
                             logger.debug("mf_gate skip %s: %s", symbol, exc)
 
                     # Gate 2: FR suficientemente negativo
                     if ft.funding_rate > config.MAX_FUNDING_RATE:
+                        logger.debug(
+                            "SCAN SKIP %s | FR %.4f%% > umbral %.4f%% (no lo suficientemente negativo).",
+                            symbol, ft.funding_rate * 100, config.MAX_FUNDING_RATE * 100,
+                        )
+                        funnel["fr_gate"] += 1
                         return
 
                     # Gate 3: dentro de la ventana de entrada
@@ -838,6 +851,7 @@ class TradingEngine:
                             ft.minutes_to_next, ft.entry_window_minutes,
                             ft.interval_hours,
                         )
+                        funnel["ventana"] += 1
                         return
 
                     # Gate 4: no en blindfold
@@ -846,6 +860,7 @@ class TradingEngine:
                             "SCAN SKIP %s | Blindfold activo (%.1f min post-snapshot)",
                             symbol, ft.minutes_since_last,
                         )
+                        funnel["blindfold"] += 1
                         return
 
                     # Gate 5: net FR positivo después de fee de cierre
@@ -854,6 +869,7 @@ class TradingEngine:
                             "SCAN SKIP %s | FR %.4f%% no cubre fee de cierre 0.06%%",
                             symbol, ft.funding_rate * 100,
                         )
+                        funnel["net_fr"] += 1
                         return
 
                     # Gate 6: predicted funding sanity check
@@ -865,11 +881,13 @@ class TradingEngine:
                                 "SCAN SKIP %s | Next FR %.4f%% no es lo suficientemente negativo.",
                                 symbol, ft.next_funding_rate * 100,
                             )
+                            funnel["predicted_fr"] += 1
                             return
 
                     # Gate 7: spread
                     spread_ok = await self._check_spread(symbol)
                     if not spread_ok:
+                        funnel["spread"] += 1
                         return
 
                     # ── Microestructura ─────────────────────────────────
@@ -887,11 +905,13 @@ class TradingEngine:
                                 "MICRO GATE BLOCK %s | VPIN %.3f (toxic). Entrada abortada.",
                                 symbol, tox.get("vpin", 0.0)
                             )
+                            funnel["micro_gate"] += 1
                             return
 
                     # Score
                     score = self._score_opportunity(symbol, ft, ticker)
 
+                    funnel["qualified"] += 1
                     async with lock:
                         qualified.append((symbol, ft, score))
 
@@ -904,9 +924,22 @@ class TradingEngine:
                     )
 
                 except Exception as exc:
+                    funnel["error"] += 1
                     logger.debug("Funding skip %s: %s", symbol, exc)
 
         await asyncio.gather(*[_check_symbol(s) for s in candidates])
+
+        # Embudo de diagnóstico: dónde mueren los candidatos por gate.
+        # Si "fr_gate" domina, el umbral MAX_FUNDING_RATE es el cuello de botella.
+        logger.info(
+            "SCAN FUNNEL | candidatos=%d | fr_gate=%d ventana=%d blindfold=%d "
+            "net=%d pred=%d spread=%d tail=%d entropy=%d mf=%d micro=%d err=%d | OK=%d",
+            len(candidates),
+            funnel["fr_gate"], funnel["ventana"], funnel["blindfold"],
+            funnel["net_fr"], funnel["predicted_fr"], funnel["spread"],
+            funnel["tail_gate"], funnel["entropy_gate"], funnel["mf_gate"],
+            funnel["micro_gate"], funnel["error"], funnel["qualified"],
+        )
 
         # Ranking: solo las TOP_N mejores
         qualified.sort(key=lambda x: x[2], reverse=True)
@@ -1024,7 +1057,7 @@ class TradingEngine:
         # ── Método 2: z-score gaussiano (fallback) ──────────────────
         mean = float(np.mean(changes[:-1]))  # excluir el actual
         std = float(np.std(changes[:-1], ddof=0))
-        if std == 0:
+        if std < config.FLOAT_EPSILON:
             return False
 
         z_score = (current_change - mean) / std
@@ -1040,10 +1073,18 @@ class TradingEngine:
 
     # ── Cálculo de amount ─────────────────────────────────────────
 
-    def _margin_to_amount(self, symbol: str, margin_usdt: float, price: float) -> float | None:
+    def _margin_to_amount(
+        self, symbol: str, margin_usdt: float, price: float
+    ) -> tuple[float, float] | None:
         """
         Convierte margen USDT a cantidad de contratos normalizada.
         amount = (margin * leverage) / (price * contractSize)
+
+        Retorna (amount, effective_margin). Si el nocional resultante queda por
+        debajo del mínimo de contrato del par y MIN_NOTIONAL_AUTO_BUMP está
+        activo, sube el margen hasta el mínimo viable y lo refleja en
+        effective_margin (el caller debe re-validar los caps de riesgo).
+        Retorna None si la entrada no es viable.
         """
         if price <= 0:
             return None
@@ -1059,23 +1100,33 @@ class TradingEngine:
         normalized = self.exchange.amount_to_precision(symbol, raw_amount)
         normalized_float = float(normalized)
 
-        if normalized_float <= 0:
-            logger.warning(
-                "%s: amount normalizado a 0 (margin=%.2f, price=%.4f, cs=%.6f).",
-                symbol, margin_usdt, price, contract_size,
-            )
-            return None
+        min_amount = (market.get("limits") or {}).get("amount", {}).get("min", 0) or 0
 
-        # Validar contra límites del mercado
-        min_amount = (market.get("limits") or {}).get("amount", {}).get("min", 0)
-        if min_amount and normalized_float < min_amount:
-            logger.warning(
-                "%s: amount %.6f < mínimo %.6f del mercado.",
-                symbol, normalized_float, min_amount,
+        # Nocional por debajo del mínimo del par: bump al mínimo viable.
+        if normalized_float <= 0 or (min_amount and normalized_float < min_amount):
+            if not config.MIN_NOTIONAL_AUTO_BUMP or not min_amount:
+                logger.warning(
+                    "%s: amount %.6f < mínimo %.6f del mercado "
+                    "(margin=%.2f, price=%.4f, cs=%.6f). Entrada descartada.",
+                    symbol, normalized_float, min_amount, margin_usdt, price, contract_size,
+                )
+                return None
+            bumped = self.exchange.amount_to_precision(symbol, min_amount)
+            bumped_float = float(bumped)
+            if bumped_float <= 0:
+                logger.warning(
+                    "%s: mínimo del par normaliza a 0; entrada inviable.", symbol,
+                )
+                return None
+            effective_margin = bumped_float * price * contract_size / config.LEVERAGE
+            logger.info(
+                "%s: nocional bajo el mínimo del par; margen %.2f → %.2f USDT "
+                "(amount %.6f, min %.6f).",
+                symbol, margin_usdt, effective_margin, bumped_float, min_amount,
             )
-            return None
+            return bumped_float, effective_margin
 
-        return normalized_float
+        return normalized_float, margin_usdt
 
     def _adaptive_margin(self, base_margin: float, ft: FundingTiming, symbol: str = "") -> float:
         """
@@ -1196,16 +1247,33 @@ class TradingEngine:
                 logger.debug("%s: adaptive sizing reduce margen a <1 USDT. Abortado.", symbol)
                 return False
 
-        amount = self._margin_to_amount(symbol, margin_usdt, price)
-        if amount is None:
+        sized = self._margin_to_amount(symbol, margin_usdt, price)
+        if sized is None:
             return False
+        amount, effective_margin = sized
+
+        # El bump al mínimo del par pudo subir el margen: re-validar caps.
+        if effective_margin > margin_usdt:
+            if not self._check_global_margin(effective_margin, symbol):
+                logger.info(
+                    "%s: margen mínimo del par %.2f USDT excede el cap global. Entrada omitida.",
+                    symbol, effective_margin,
+                )
+                return False
+            if state.total_margin_used + effective_margin > config.MAX_MARGIN_PER_COIN:
+                logger.info(
+                    "%s: margen mínimo del par (%.2f + %.2f) > límite %.2f. Entrada omitida.",
+                    symbol, state.total_margin_used, effective_margin, config.MAX_MARGIN_PER_COIN,
+                )
+                return False
+            margin_usdt = effective_margin
 
         # ── DRY-RUN ───────────────────────────────────────────────
         if config.DRY_RUN:
             order_id = f"dry-run-{int(time.time() * 1000)}"
             fill_price = price
             state.last_entry_price = fill_price
-            state.total_margin_used += margin_usdt
+            state.total_margin_used = round(state.total_margin_used + margin_usdt, 8)
             state.last_order_ts = time.time()
             logger.info(
                 "[DRY-RUN] BUY %s | %s | $%.2f margin | %.6f amt | @%.6f | OID:%s",
@@ -1267,7 +1335,7 @@ class TradingEngine:
 
         status = order.get("status", "unknown")
         state.last_entry_price = fill_price
-        state.total_margin_used += real_margin
+        state.total_margin_used = round(state.total_margin_used + real_margin, 8)
         state.last_order_ts = time.time()
 
         logger.info(
@@ -1690,7 +1758,7 @@ class TradingEngine:
         stale_cutoff = 3600  # 1 hora sin actividad
         to_delete = [
             sym for sym, state in self.states.items()
-            if state.total_margin_used == 0.0
+            if state.total_margin_used <= config.FLOAT_EPSILON
             and state.last_order_ts < now - stale_cutoff
             and len(state.oi_history) == 0
         ]

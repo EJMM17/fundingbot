@@ -24,6 +24,8 @@ from typing import Any
 
 import numpy as np
 
+import config
+
 logger = logging.getLogger("micro")
 
 
@@ -54,7 +56,7 @@ class MicrostructureAnalyzer:
         base_vol = ticker.get("baseVolume") or 0.0
         vwap = ticker.get("vwap") or 0.0
 
-        if bid <= 0 or ask <= 0 or last <= 0:
+        if bid <= config.FLOAT_EPSILON or ask <= config.FLOAT_EPSILON or last <= config.FLOAT_EPSILON:
             return {"valid": False}
 
         mid = (bid + ask) / 2.0
@@ -64,7 +66,7 @@ class MicrostructureAnalyzer:
         # Price impact proxy (Kyle's lambda simplificado)
         # λ ≈ |Δprice| / √volume
         price_impact = 0.0
-        if self._last_price > 0 and base_vol > 0:
+        if self._last_price > config.FLOAT_EPSILON and base_vol > config.FLOAT_EPSILON:
             ret = abs(last - self._last_price) / self._last_price
             price_impact = ret / math.sqrt(base_vol + 1.0)
             self._last_returns.append(ret)
@@ -73,7 +75,7 @@ class MicrostructureAnalyzer:
         # Bid-Ask Imbalance (proxy de dirección del flow)
         # Como no tenemos L2, usamos vwap vs mid como proxy
         imbalance = 0.0
-        if vwap > 0 and mid > 0:
+        if vwap > config.FLOAT_EPSILON and mid > config.FLOAT_EPSILON:
             imbalance = (vwap - mid) / mid
 
         # Bucket volume para VPIN
@@ -101,7 +103,7 @@ class MicrostructureAnalyzer:
         vpin = 0.0
         if len(self._volume_buckets) >= 10:
             total_vol = sum(self._volume_buckets)
-            if total_vol > 0:
+            if total_vol > config.FLOAT_EPSILON:
                 vpin = sum(
                     abs(b - s) for b, s in zip(self._buy_volume_buckets, self._sell_volume_buckets)
                 ) / total_vol

@@ -12,16 +12,20 @@ KuCoin Futures USD-M:
   Ciclos:     BTC/ETH = 8h | mayoría altcoins = 4h | algunos = 1h
   FR cap/floor: dinámico por par, típicamente ±0.375% para contratos 5x
 
-Umbral mínimo de entrada (MAX_FUNDING_RATE = -0.20%):
-  FR cobrado:        ≥ +0.20% del notional por ciclo
+Umbral mínimo de entrada (MAX_FUNDING_RATE = -0.15%):
+  FR cobrado:        ≥ +0.15% del notional por ciclo
   Fee round-trip:      0.12% del notional
-  Net mínimo esperado: 0.08% por ciclo → positivo incluso con slippage
+  Net mínimo esperado: 0.03% por ciclo → positivo incluso con slippage
 
-  NOTA: -0.20% es MUCHO más estricto que MEXC (-1.0%).
+  NOTA: -0.15% es MUCHO más estricto que MEXC (-1.0%).
   En KuCoin los FR negativos profundos son menos frecuentes pero
   el floor del exchange protege contra sorpresas extremas.
-  Si quieres más oportunidades: ajusta a -0.15%.
-  Si quieres más seguridad: deja en -0.20%.
+  ADVERTENCIA: -0.15% por ciclo es un FR muy profundo; en mercado
+  tranquilo casi ningún par lo alcanza y el bot puede pasar horas sin
+  entrar. Revisa el log "SCAN FUNNEL" para ver si este gate es el cuello
+  de botella antes de relajarlo.
+  Si quieres más oportunidades: sube hacia -0.10% / -0.05%.
+  Si quieres más seguridad: baja hacia -0.20%.
 
 Stop-loss absoluto (MAX_LOSS_ROE_PCT = -20.0%):
   Con 5x leverage, -20% ROE = -4% movimiento adverse en precio.
@@ -82,6 +86,12 @@ KUCOIN_API_KEY: str = _require_env("KUCOIN_API_KEY")
 KUCOIN_SECRET: str = _require_env("KUCOIN_SECRET")
 KUCOIN_PASSPHRASE: str = _require_env("KUCOIN_PASSPHRASE")  # Obligatorio en KuCoin
 
+# ── Numérico ──────────────────────────────────────────────────────
+# Tolerancia para comparaciones de igualdad y guardas de división contra
+# valores casi-cero. Evita que ruido de coma flotante (1e-15) dispare
+# divisiones explosivas o bloquee resets de estado por "== 0.0" exacto.
+FLOAT_EPSILON: float = 1e-9
+
 # ── Exchange ──────────────────────────────────────────────────────
 # KuCoin Futures es una clase SEPARADA en ccxt: 'kucoinfutures'
 # NO es ccxt.kucoin con defaultType='swap'. Son clases distintas.
@@ -115,6 +125,14 @@ MAX_TOTAL_MARGIN: float = _env_float("MAX_TOTAL_MARGIN", 500.0)         # USDT m
 MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 8)             # Máximo de posiciones simultáneas (más candidatos al bajar el piso)
 COOLDOWN_SECONDS: int = 60                  # Entre órdenes de la misma moneda
 INITIAL_ENTRY_MARGIN: float = 5.0           # Primera entrada en USDT
+
+# Si el nocional resultante (margin * leverage) no alcanza el tamaño mínimo
+# de contrato del par, subir el margen automáticamente hasta el mínimo viable
+# en vez de descartar la entrada en silencio. Acotado por MAX_MARGIN_PER_COIN
+# y por el cap global: si ni así alcanza, se omite con log explícito.
+# Rationale: con 5 USDT * 5x = $25 de nocional, muchos pares quedan por debajo
+# del mínimo del exchange y la oportunidad se perdía sin rastro claro.
+MIN_NOTIONAL_AUTO_BUMP: bool = True
 
 # ── Stop-loss absoluto (ausente en v2, crítico para producción) ────
 # Si ROE cae a este nivel → cerrar incondicionalmente.
