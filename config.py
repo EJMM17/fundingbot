@@ -114,7 +114,7 @@ MAX_MARGIN_PER_COIN: float = _env_float("MAX_MARGIN_PER_COIN", 100.0)   # USDT m
 MAX_TOTAL_MARGIN: float = _env_float("MAX_TOTAL_MARGIN", 500.0)         # USDT máximo en TODAS las posiciones (capital total acotado)
 MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 8)             # Máximo de posiciones simultáneas (más candidatos al bajar el piso)
 COOLDOWN_SECONDS: int = 60                  # Entre órdenes de la misma moneda
-INITIAL_ENTRY_MARGIN: float = 5.0           # Primera entrada en USDT
+INITIAL_ENTRY_MARGIN: float = 15.0          # Primera entrada en USDT (mín 15 para cubrir contratos de altcoins a $50-100+)
 
 # ── Stop-loss absoluto (ausente en v2, crítico para producción) ────
 # Si ROE cae a este nivel → cerrar incondicionalmente.
@@ -174,7 +174,7 @@ MAX_SLIPPAGE_PCT: float = 0.0070           # 0.70%
 # Subido a 0.15%: con el piso de volumen en 5M, ESTE es el verdadero
 # filtro de liquidez. Trade-off: spread mayor = más coste de slippage
 # en market orders, por eso no se relaja más allá de 0.15%.
-MAX_SPREAD_PCT: float = 0.0015             # 0.15%
+MAX_SPREAD_PCT: float = 0.0020             # 0.20% (ampliado para mercados bajistas volátiles con spreads más anchos)
 
 # ── Blindfold post-funding (anti-dump) ────────────────────────────
 # Después del snapshot, scalpers cierran masivamente causando un dump.
@@ -283,6 +283,8 @@ EVT_THRESHOLD_PCT: float = 0.90         # Percentil para umbral POT (90% = top 1
 ENABLE_TAIL_GATES: bool = True          # Gate de cola pesada
 TAIL_ALPHA_MIN_ENTRY: float = 2.5       # α mínima para entrar (α < 2.5 = cola catastrófica)
 TAIL_ALPHA_WARNING: float = 3.0         # α de advertencia
+TAIL_RISK_MAX_ENTRY: float = 0.75       # Índice de riesgo de cola máximo para entrar
+                                        # (0 = colas ligeras, 1 = colas catastróficas)
 
 # Hurst / Persistencia
 ENABLE_HURST_FILTER: bool = True
@@ -292,7 +294,9 @@ HURST_CALCULATION_METHOD: str = "dfa"   # "rs" o "dfa" (DFA recomendado)
 
 # Entropía / Teoría de la Información
 ENABLE_ENTROPY_GATES: bool = True
-ENTROPY_MAX_ENTRY: float = 0.75         # Entropía normalizada máxima para entrar
+ENTROPY_MAX_ENTRY: float = 0.85         # Entropía normalizada máxima para entrar.
+                                        # 0.75 era demasiado restrictivo para altcoins
+                                        # con FR que fluctúa legítimamente (rango real ~0.75–0.85)
 ENTROPY_MIN_BONUS: float = 0.40         # Entropía para bonus de predictibilidad
 TE_MIN_FOR_OI_WEIGHT: float = 0.01      # Transfer entropy mínimo para confiar en OI
 
@@ -304,7 +308,9 @@ LOG_VOL_CALM_PERCENTILE: float = 0.25
 # Multifractalidad
 ENABLE_MULTIFRACTAL_GATES: bool = True
 MULTIFRACTAL_WIDTH_THRESHOLD: float = 0.50  # Δα umbral para penalización
-MULTIFRACTAL_WIDTH_ABORT: float = 0.70      # Δα para abortar entrada
+MULTIFRACTAL_WIDTH_ABORT: float = 0.80      # Δα para abortar entrada.
+                                            # 0.70 era demasiado estricto para altcoins
+                                            # de menor cap que tienen espectros más anchos
 
 # Scoring
 ENABLE_MATH_SCORING: bool = True        # Reemplazar scoring simple por power_score

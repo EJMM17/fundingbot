@@ -204,6 +204,10 @@ class TradingEngine:
         self._last_heartbeat_ts: float = 0.0
         self._daily_drawdown_triggered: bool = False
         self._daily_drawdown_ts: float = 0.0
+        # Diagnóstico acumulado entre heartbeats
+        self._scan_cycles: int = 0
+        self._best_fr_seen: float = 0.0      # FR más negativo visto desde el último heartbeat
+        self._best_fr_symbol: str = ""
         self.learning: auto_learning.AutoLearningEngine | None = (
             auto_learning.AutoLearningEngine(db_local.DB_PATH)
             if config.ENABLE_AUTO_LEARNING
@@ -741,12 +745,24 @@ class TradingEngine:
                     ticker.get("last") or ticker.get("close") or 0
                 )
 
-        logger.debug("SCAN: %d candidatos por volumen.", len(candidates))
+        logger.info("SCAN: %d candidatos por volumen (>= %.0f USDT).", len(candidates), config.MIN_VOLUME_24H)
 
         # Fetch funding rates en paralelo (semáforo = 5 concurrentes)
         semaphore = asyncio.Semaphore(5)
         qualified: list[tuple[str, FundingTiming, float]] = []  # (sym, ft, score)
         lock = asyncio.Lock()
+
+        # Contadores diagnóstico (thread-safe porque se usan con asyncio.Lock)
+        diag: dict[str, int | float | str] = {
+            "fr_neg": 0,        # tienen FR negativo (cualquier valor)
+            "fr_ok": 0,         # FR <= MAX_FUNDING_RATE
+            "window_ok": 0,     # dentro de la ventana de entrada
+            "passed_all": 0,    # pasaron todos los gates
+            "best_fr": 0.0,     # FR más negativo visto en este scan
+            "best_sym": "",     # símbolo con FR más negativo
+            "best_min": 9999.0, # minutos al snapshot del mejor FR
+        }
+        diag_lock = asyncio.Lock()
 
         async def _check_symbol(symbol: str) -> None:
             async with semaphore:
@@ -771,7 +787,89 @@ class TradingEngine:
                     if ft.scan_price > 0:
                         state.price_history.append(ft.scan_price)
 
-                    # ── Gates matemáticos (hard constraints) ──────────────
+                    # ── Tracking diagnóstico ──────────────────────────────
+                    if ft.funding_rate < 0:
+                        async with diag_lock:
+                            diag["fr_neg"] += 1
+                            if ft.funding_rate < diag["best_fr"]:
+                                diag["best_fr"] = ft.funding_rate
+                                diag["best_sym"] = symbol
+                                diag["best_min"] = ft.minutes_to_next
+
+                    # ── Gates baratos primero (early-exit antes del cómputo caro) ─
+
+                    # Gate 1: FR suficientemente negativo
+                    if ft.funding_rate > config.MAX_FUNDING_RATE:
+                        logger.debug(
+                            "SCAN SKIP %s | FR %.4f%% > umbral %.4f%% (no suficientemente negativo).",
+                            symbol, ft.funding_rate * 100, config.MAX_FUNDING_RATE * 100,
+                        )
+                        return
+
+                    async with diag_lock:
+                        diag["fr_ok"] += 1
+
+                    # Gate 2: dentro de la ventana de entrada
+                    if ft.minutes_to_next > ft.entry_window_minutes:
+                        logger.debug(
+                            "SCAN SKIP %s | FR: %.4f%% OK | "
+                            "Faltan %.1f min (ventana %.1f min, ciclo %.0fh)",
+                            symbol, ft.funding_rate * 100,
+                            ft.minutes_to_next, ft.entry_window_minutes,
+                            ft.interval_hours,
+                        )
+                        return
+
+                    async with diag_lock:
+                        diag["window_ok"] += 1
+
+                    # Gate 3: no en blindfold post-snapshot
+                    if self._is_in_blindfold(ft):
+                        logger.debug(
+                            "SCAN SKIP %s | Blindfold activo (%.1f min post-snapshot)",
+                            symbol, ft.minutes_since_last,
+                        )
+                        return
+
+                    # Gate 4: net FR positivo después de fee de cierre (0.06% taker)
+                    if ft.net_fr_after_fees <= 0:
+                        logger.debug(
+                            "SCAN SKIP %s | FR %.4f%% no cubre fee de cierre 0.06%%",
+                            symbol, ft.funding_rate * 100,
+                        )
+                        return
+
+                    # Gate 5: predicted funding sanity check
+                    # IMPORTANTE: solo aplicar si KuCoin proveyó el dato.
+                    # Cuando nextFundingRate está ausente, ccxt devuelve 0.0,
+                    # y 0.0 >= 0.0 bloquearía todas las entradas.
+                    # Usamos EXIT_FUNDING_RATE (0.0): solo descartar si el próximo
+                    # ciclo el FR ya se volvió positivo (sin tesis de cobro).
+                    if config.USE_PREDICTED_FUNDING_CHECK and ft.next_funding_rate != 0.0:
+                        if ft.next_funding_rate >= config.EXIT_FUNDING_RATE:
+                            logger.debug(
+                                "SCAN SKIP %s | Next FR %.4f%% ya es positivo — sin tesis.",
+                                symbol, ft.next_funding_rate * 100,
+                            )
+                            return
+
+                    # Gate 6: spread bid-ask (calculado inline desde tickers del scan)
+                    # Evita un fetch_ticker() adicional por símbolo candidato.
+                    _ticker_snap = tickers.get(symbol, {})
+                    _bid = _ticker_snap.get("bid")
+                    _ask = _ticker_snap.get("ask")
+                    if _bid and _ask and _bid > 0:
+                        _spread = (_ask - _bid) / _bid
+                        if _spread > config.MAX_SPREAD_PCT:
+                            logger.info(
+                                "SPREAD GATE %s | %.4f%% > %.4f%%",
+                                symbol, _spread * 100, config.MAX_SPREAD_PCT * 100,
+                            )
+                            return
+
+                    # ── Gates matemáticos (hard constraints, cómputo intensivo) ─
+                    # Solo se ejecutan para símbolos que pasaron los 6 gates baratos.
+
                     # Tail Risk Gate
                     if config.ENABLE_TAIL_GATES and len(state.log_return_history) >= 20:
                         try:
@@ -781,10 +879,10 @@ class TradingEngine:
                             state.last_tail_alpha = tail_info["alpha"]
                             state.last_tail_pvalue = tail_info["pvalue"]
                             state.last_tail_risk = tail_info["risk"]
-                            if tail_info["risk"] > 0.7:
+                            if tail_info["risk"] > config.TAIL_RISK_MAX_ENTRY:
                                 logger.info(
-                                    "MATH GATE BLOCK %s | Tail risk %.2f > 0.7 (α=%.2f). Entrada abortada.",
-                                    symbol, tail_info["risk"], tail_info["alpha"]
+                                    "MATH GATE BLOCK %s | Tail risk %.2f > %.2f (α=%.2f). Entrada abortada.",
+                                    symbol, tail_info["risk"], config.TAIL_RISK_MAX_ENTRY, tail_info["alpha"]
                                 )
                                 return
                         except Exception as exc:
@@ -825,53 +923,6 @@ class TradingEngine:
                         except Exception as exc:
                             logger.debug("mf_gate skip %s: %s", symbol, exc)
 
-                    # Gate 2: FR suficientemente negativo
-                    if ft.funding_rate > config.MAX_FUNDING_RATE:
-                        return
-
-                    # Gate 3: dentro de la ventana de entrada
-                    if ft.minutes_to_next > ft.entry_window_minutes:
-                        logger.debug(
-                            "SCAN SKIP %s | FR: %.4f%% OK | "
-                            "Faltan %.1f min (ventana %.1f min, ciclo %.0fh)",
-                            symbol, ft.funding_rate * 100,
-                            ft.minutes_to_next, ft.entry_window_minutes,
-                            ft.interval_hours,
-                        )
-                        return
-
-                    # Gate 4: no en blindfold
-                    if self._is_in_blindfold(ft):
-                        logger.debug(
-                            "SCAN SKIP %s | Blindfold activo (%.1f min post-snapshot)",
-                            symbol, ft.minutes_since_last,
-                        )
-                        return
-
-                    # Gate 5: net FR positivo después de fee de cierre
-                    if ft.net_fr_after_fees <= 0:
-                        logger.debug(
-                            "SCAN SKIP %s | FR %.4f%% no cubre fee de cierre 0.06%%",
-                            symbol, ft.funding_rate * 100,
-                        )
-                        return
-
-                    # Gate 6: predicted funding sanity check
-                    if config.USE_PREDICTED_FUNDING_CHECK:
-                        # Si el predicted ya es positivo o menos negativo que umbral,
-                        # la tesis se debilita para el siguiente ciclo
-                        if ft.next_funding_rate > config.MAX_FUNDING_RATE * 0.5:
-                            logger.debug(
-                                "SCAN SKIP %s | Next FR %.4f%% no es lo suficientemente negativo.",
-                                symbol, ft.next_funding_rate * 100,
-                            )
-                            return
-
-                    # Gate 7: spread
-                    spread_ok = await self._check_spread(symbol)
-                    if not spread_ok:
-                        return
-
                     # ── Microestructura ─────────────────────────────────
                     ticker = tickers.get(symbol, {})
                     state = self.states[symbol]
@@ -894,6 +945,8 @@ class TradingEngine:
 
                     async with lock:
                         qualified.append((symbol, ft, score))
+                    async with diag_lock:
+                        diag["passed_all"] += 1
 
                     logger.info(
                         "SCAN OK %s | FR: %.4f%% | Ciclo: %.0fh | "
@@ -907,6 +960,30 @@ class TradingEngine:
                     logger.debug("Funding skip %s: %s", symbol, exc)
 
         await asyncio.gather(*[_check_symbol(s) for s in candidates])
+
+        # ── Resumen diagnóstico del scan (INFO level, visible siempre) ─
+        best_fr_pct = diag["best_fr"] * 100
+        best_info = (
+            f" | Mejor FR: {best_fr_pct:.4f}% ({diag['best_sym']}, {diag['best_min']:.0f} min al snapshot)"
+            if diag["best_sym"]
+            else " | Sin FRs negativos detectados"
+        )
+        logger.info(
+            "SCAN RESUMEN | Vol OK: %d | FR neg: %d | FR <= %.2f%%: %d | "
+            "En ventana: %d | Calificados: %d%s",
+            len(candidates),
+            diag["fr_neg"],
+            config.MAX_FUNDING_RATE * 100,
+            diag["fr_ok"],
+            diag["window_ok"],
+            diag["passed_all"],
+            best_info,
+        )
+        # Alimentar stats de heartbeat
+        self._scan_cycles += 1
+        if diag["best_fr"] < self._best_fr_seen:
+            self._best_fr_seen = diag["best_fr"]
+            self._best_fr_symbol = diag["best_sym"]
 
         # Ranking: solo las TOP_N mejores
         qualified.sort(key=lambda x: x[2], reverse=True)
@@ -1693,6 +1770,7 @@ class TradingEngine:
             if state.total_margin_used == 0.0
             and state.last_order_ts < now - stale_cutoff
             and len(state.oi_history) == 0
+            and len(state.fr_history) < 10  # preservar si acumuló histórico útil para math gates
         ]
         for sym in to_delete:
             del self.states[sym]
@@ -1982,13 +2060,24 @@ class TradingEngine:
             self._last_heartbeat_ts = now
             total_margin = self._total_margin_used()
             open_count = self._open_position_count()
-            logger.info(
-                "HEARTBEAT | Posiciones: %d | Margen total: %.2f / %.2f USDT | "
-                "Circuit: %s | Drawdown: %s",
-                open_count, total_margin, config.MAX_TOTAL_MARGIN,
-                "OPEN" if self._circuit_open else "closed",
-                "TRIGGERED" if self._daily_drawdown_triggered else "ok",
+            best_fr_info = (
+                f" | Mejor FR ({self._best_fr_symbol}): {self._best_fr_seen*100:.4f}%"
+                if self._best_fr_symbol
+                else " | Sin FRs negativos en este periodo"
             )
+            logger.info(
+                "HEARTBEAT | Posiciones: %d | Margen: %.2f/%.2f USDT | "
+                "Ciclos scan: %d | Circuit: %s | DD: %s%s",
+                open_count, total_margin, config.MAX_TOTAL_MARGIN,
+                self._scan_cycles,
+                "OPEN" if self._circuit_open else "ok",
+                "ACTIVO" if self._daily_drawdown_triggered else "ok",
+                best_fr_info,
+            )
+            # Reset stats de periodo
+            self._scan_cycles = 0
+            self._best_fr_seen = 0.0
+            self._best_fr_symbol = ""
 
         # Limpiar estados vacíos
         self._cleanup_stale_states()
