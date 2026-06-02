@@ -204,6 +204,10 @@ class TradingEngine:
         self._last_heartbeat_ts: float = 0.0
         self._daily_drawdown_triggered: bool = False
         self._daily_drawdown_ts: float = 0.0
+        # Diagnóstico acumulado entre heartbeats
+        self._scan_cycles: int = 0
+        self._best_fr_seen: float = 0.0      # FR más negativo visto desde el último heartbeat
+        self._best_fr_symbol: str = ""
         self.learning: auto_learning.AutoLearningEngine | None = (
             auto_learning.AutoLearningEngine(db_local.DB_PATH)
             if config.ENABLE_AUTO_LEARNING
@@ -741,12 +745,24 @@ class TradingEngine:
                     ticker.get("last") or ticker.get("close") or 0
                 )
 
-        logger.debug("SCAN: %d candidatos por volumen.", len(candidates))
+        logger.info("SCAN: %d candidatos por volumen (>= %.0f USDT).", len(candidates), config.MIN_VOLUME_24H)
 
         # Fetch funding rates en paralelo (semáforo = 5 concurrentes)
         semaphore = asyncio.Semaphore(5)
         qualified: list[tuple[str, FundingTiming, float]] = []  # (sym, ft, score)
         lock = asyncio.Lock()
+
+        # Contadores diagnóstico (thread-safe porque se usan con asyncio.Lock)
+        diag: dict[str, int | float | str] = {
+            "fr_neg": 0,        # tienen FR negativo (cualquier valor)
+            "fr_ok": 0,         # FR <= MAX_FUNDING_RATE
+            "window_ok": 0,     # dentro de la ventana de entrada
+            "passed_all": 0,    # pasaron todos los gates
+            "best_fr": 0.0,     # FR más negativo visto en este scan
+            "best_sym": "",     # símbolo con FR más negativo
+            "best_min": 9999.0, # minutos al snapshot del mejor FR
+        }
+        diag_lock = asyncio.Lock()
 
         async def _check_symbol(symbol: str) -> None:
             async with semaphore:
@@ -771,6 +787,15 @@ class TradingEngine:
                     if ft.scan_price > 0:
                         state.price_history.append(ft.scan_price)
 
+                    # ── Tracking diagnóstico ──────────────────────────────
+                    if ft.funding_rate < 0:
+                        async with diag_lock:
+                            diag["fr_neg"] += 1
+                            if ft.funding_rate < diag["best_fr"]:
+                                diag["best_fr"] = ft.funding_rate
+                                diag["best_sym"] = symbol
+                                diag["best_min"] = ft.minutes_to_next
+
                     # ── Gates baratos primero (early-exit antes del cómputo caro) ─
 
                     # Gate 1: FR suficientemente negativo
@@ -780,6 +805,9 @@ class TradingEngine:
                             symbol, ft.funding_rate * 100, config.MAX_FUNDING_RATE * 100,
                         )
                         return
+
+                    async with diag_lock:
+                        diag["fr_ok"] += 1
 
                     # Gate 2: dentro de la ventana de entrada
                     if ft.minutes_to_next > ft.entry_window_minutes:
@@ -791,6 +819,9 @@ class TradingEngine:
                             ft.interval_hours,
                         )
                         return
+
+                    async with diag_lock:
+                        diag["window_ok"] += 1
 
                     # Gate 3: no en blindfold post-snapshot
                     if self._is_in_blindfold(ft):
@@ -912,6 +943,8 @@ class TradingEngine:
 
                     async with lock:
                         qualified.append((symbol, ft, score))
+                    async with diag_lock:
+                        diag["passed_all"] += 1
 
                     logger.info(
                         "SCAN OK %s | FR: %.4f%% | Ciclo: %.0fh | "
@@ -925,6 +958,30 @@ class TradingEngine:
                     logger.debug("Funding skip %s: %s", symbol, exc)
 
         await asyncio.gather(*[_check_symbol(s) for s in candidates])
+
+        # ── Resumen diagnóstico del scan (INFO level, visible siempre) ─
+        best_fr_pct = diag["best_fr"] * 100
+        best_info = (
+            f" | Mejor FR: {best_fr_pct:.4f}% ({diag['best_sym']}, {diag['best_min']:.0f} min al snapshot)"
+            if diag["best_sym"]
+            else " | Sin FRs negativos detectados"
+        )
+        logger.info(
+            "SCAN RESUMEN | Vol OK: %d | FR neg: %d | FR <= %.2f%%: %d | "
+            "En ventana: %d | Calificados: %d%s",
+            len(candidates),
+            diag["fr_neg"],
+            config.MAX_FUNDING_RATE * 100,
+            diag["fr_ok"],
+            diag["window_ok"],
+            diag["passed_all"],
+            best_info,
+        )
+        # Alimentar stats de heartbeat
+        self._scan_cycles += 1
+        if diag["best_fr"] < self._best_fr_seen:
+            self._best_fr_seen = diag["best_fr"]
+            self._best_fr_symbol = diag["best_sym"]
 
         # Ranking: solo las TOP_N mejores
         qualified.sort(key=lambda x: x[2], reverse=True)
@@ -2001,13 +2058,24 @@ class TradingEngine:
             self._last_heartbeat_ts = now
             total_margin = self._total_margin_used()
             open_count = self._open_position_count()
-            logger.info(
-                "HEARTBEAT | Posiciones: %d | Margen total: %.2f / %.2f USDT | "
-                "Circuit: %s | Drawdown: %s",
-                open_count, total_margin, config.MAX_TOTAL_MARGIN,
-                "OPEN" if self._circuit_open else "closed",
-                "TRIGGERED" if self._daily_drawdown_triggered else "ok",
+            best_fr_info = (
+                f" | Mejor FR ({self._best_fr_symbol}): {self._best_fr_seen*100:.4f}%"
+                if self._best_fr_symbol
+                else " | Sin FRs negativos en este periodo"
             )
+            logger.info(
+                "HEARTBEAT | Posiciones: %d | Margen: %.2f/%.2f USDT | "
+                "Ciclos scan: %d | Circuit: %s | DD: %s%s",
+                open_count, total_margin, config.MAX_TOTAL_MARGIN,
+                self._scan_cycles,
+                "OPEN" if self._circuit_open else "ok",
+                "ACTIVO" if self._daily_drawdown_triggered else "ok",
+                best_fr_info,
+            )
+            # Reset stats de periodo
+            self._scan_cycles = 0
+            self._best_fr_seen = 0.0
+            self._best_fr_symbol = ""
 
         # Limpiar estados vacíos
         self._cleanup_stale_states()
