@@ -114,7 +114,7 @@ MAX_MARGIN_PER_COIN: float = _env_float("MAX_MARGIN_PER_COIN", 100.0)   # USDT m
 MAX_TOTAL_MARGIN: float = _env_float("MAX_TOTAL_MARGIN", 500.0)         # USDT máximo en TODAS las posiciones (capital total acotado)
 MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 8)             # Máximo de posiciones simultáneas (más candidatos al bajar el piso)
 COOLDOWN_SECONDS: int = 60                  # Entre órdenes de la misma moneda
-INITIAL_ENTRY_MARGIN: float = 5.0           # Primera entrada en USDT
+INITIAL_ENTRY_MARGIN: float = 15.0          # Primera entrada en USDT (mín 15 para cubrir contratos de altcoins a $50-100+)
 
 # ── Stop-loss absoluto (ausente en v2, crítico para producción) ────
 # Si ROE cae a este nivel → cerrar incondicionalmente.
@@ -174,7 +174,7 @@ MAX_SLIPPAGE_PCT: float = 0.0070           # 0.70%
 # Subido a 0.15%: con el piso de volumen en 5M, ESTE es el verdadero
 # filtro de liquidez. Trade-off: spread mayor = más coste de slippage
 # en market orders, por eso no se relaja más allá de 0.15%.
-MAX_SPREAD_PCT: float = 0.0015             # 0.15%
+MAX_SPREAD_PCT: float = 0.0020             # 0.20% (ampliado para mercados bajistas volátiles con spreads más anchos)
 
 # ── Blindfold post-funding (anti-dump) ────────────────────────────
 # Después del snapshot, scalpers cierran masivamente causando un dump.

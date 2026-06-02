@@ -842,11 +842,13 @@ class TradingEngine:
                     # Gate 5: predicted funding sanity check
                     # IMPORTANTE: solo aplicar si KuCoin proveyó el dato.
                     # Cuando nextFundingRate está ausente, ccxt devuelve 0.0,
-                    # y 0.0 > -0.00075 bloquearía todas las entradas.
+                    # y 0.0 >= 0.0 bloquearía todas las entradas.
+                    # Usamos EXIT_FUNDING_RATE (0.0): solo descartar si el próximo
+                    # ciclo el FR ya se volvió positivo (sin tesis de cobro).
                     if config.USE_PREDICTED_FUNDING_CHECK and ft.next_funding_rate != 0.0:
-                        if ft.next_funding_rate > config.MAX_FUNDING_RATE * 0.5:
+                        if ft.next_funding_rate >= config.EXIT_FUNDING_RATE:
                             logger.debug(
-                                "SCAN SKIP %s | Next FR %.4f%% no es lo suficientemente negativo.",
+                                "SCAN SKIP %s | Next FR %.4f%% ya es positivo — sin tesis.",
                                 symbol, ft.next_funding_rate * 100,
                             )
                             return
