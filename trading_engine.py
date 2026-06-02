@@ -771,7 +771,72 @@ class TradingEngine:
                     if ft.scan_price > 0:
                         state.price_history.append(ft.scan_price)
 
-                    # ── Gates matemáticos (hard constraints) ──────────────
+                    # ── Gates baratos primero (early-exit antes del cómputo caro) ─
+
+                    # Gate 1: FR suficientemente negativo
+                    if ft.funding_rate > config.MAX_FUNDING_RATE:
+                        logger.debug(
+                            "SCAN SKIP %s | FR %.4f%% > umbral %.4f%% (no suficientemente negativo).",
+                            symbol, ft.funding_rate * 100, config.MAX_FUNDING_RATE * 100,
+                        )
+                        return
+
+                    # Gate 2: dentro de la ventana de entrada
+                    if ft.minutes_to_next > ft.entry_window_minutes:
+                        logger.debug(
+                            "SCAN SKIP %s | FR: %.4f%% OK | "
+                            "Faltan %.1f min (ventana %.1f min, ciclo %.0fh)",
+                            symbol, ft.funding_rate * 100,
+                            ft.minutes_to_next, ft.entry_window_minutes,
+                            ft.interval_hours,
+                        )
+                        return
+
+                    # Gate 3: no en blindfold post-snapshot
+                    if self._is_in_blindfold(ft):
+                        logger.debug(
+                            "SCAN SKIP %s | Blindfold activo (%.1f min post-snapshot)",
+                            symbol, ft.minutes_since_last,
+                        )
+                        return
+
+                    # Gate 4: net FR positivo después de fee de cierre (0.06% taker)
+                    if ft.net_fr_after_fees <= 0:
+                        logger.debug(
+                            "SCAN SKIP %s | FR %.4f%% no cubre fee de cierre 0.06%%",
+                            symbol, ft.funding_rate * 100,
+                        )
+                        return
+
+                    # Gate 5: predicted funding sanity check
+                    # IMPORTANTE: solo aplicar si KuCoin proveyó el dato.
+                    # Cuando nextFundingRate está ausente, ccxt devuelve 0.0,
+                    # y 0.0 > -0.00075 bloquearía todas las entradas.
+                    if config.USE_PREDICTED_FUNDING_CHECK and ft.next_funding_rate != 0.0:
+                        if ft.next_funding_rate > config.MAX_FUNDING_RATE * 0.5:
+                            logger.debug(
+                                "SCAN SKIP %s | Next FR %.4f%% no es lo suficientemente negativo.",
+                                symbol, ft.next_funding_rate * 100,
+                            )
+                            return
+
+                    # Gate 6: spread bid-ask (calculado inline desde tickers del scan)
+                    # Evita un fetch_ticker() adicional por símbolo candidato.
+                    _ticker_snap = tickers.get(symbol, {})
+                    _bid = _ticker_snap.get("bid")
+                    _ask = _ticker_snap.get("ask")
+                    if _bid and _ask and _bid > 0:
+                        _spread = (_ask - _bid) / _bid
+                        if _spread > config.MAX_SPREAD_PCT:
+                            logger.info(
+                                "SPREAD GATE %s | %.4f%% > %.4f%%",
+                                symbol, _spread * 100, config.MAX_SPREAD_PCT * 100,
+                            )
+                            return
+
+                    # ── Gates matemáticos (hard constraints, cómputo intensivo) ─
+                    # Solo se ejecutan para símbolos que pasaron los 6 gates baratos.
+
                     # Tail Risk Gate
                     if config.ENABLE_TAIL_GATES and len(state.log_return_history) >= 20:
                         try:
@@ -781,10 +846,10 @@ class TradingEngine:
                             state.last_tail_alpha = tail_info["alpha"]
                             state.last_tail_pvalue = tail_info["pvalue"]
                             state.last_tail_risk = tail_info["risk"]
-                            if tail_info["risk"] > 0.7:
+                            if tail_info["risk"] > config.TAIL_RISK_MAX_ENTRY:
                                 logger.info(
-                                    "MATH GATE BLOCK %s | Tail risk %.2f > 0.7 (α=%.2f). Entrada abortada.",
-                                    symbol, tail_info["risk"], tail_info["alpha"]
+                                    "MATH GATE BLOCK %s | Tail risk %.2f > %.2f (α=%.2f). Entrada abortada.",
+                                    symbol, tail_info["risk"], config.TAIL_RISK_MAX_ENTRY, tail_info["alpha"]
                                 )
                                 return
                         except Exception as exc:
@@ -824,53 +889,6 @@ class TradingEngine:
                                 return
                         except Exception as exc:
                             logger.debug("mf_gate skip %s: %s", symbol, exc)
-
-                    # Gate 2: FR suficientemente negativo
-                    if ft.funding_rate > config.MAX_FUNDING_RATE:
-                        return
-
-                    # Gate 3: dentro de la ventana de entrada
-                    if ft.minutes_to_next > ft.entry_window_minutes:
-                        logger.debug(
-                            "SCAN SKIP %s | FR: %.4f%% OK | "
-                            "Faltan %.1f min (ventana %.1f min, ciclo %.0fh)",
-                            symbol, ft.funding_rate * 100,
-                            ft.minutes_to_next, ft.entry_window_minutes,
-                            ft.interval_hours,
-                        )
-                        return
-
-                    # Gate 4: no en blindfold
-                    if self._is_in_blindfold(ft):
-                        logger.debug(
-                            "SCAN SKIP %s | Blindfold activo (%.1f min post-snapshot)",
-                            symbol, ft.minutes_since_last,
-                        )
-                        return
-
-                    # Gate 5: net FR positivo después de fee de cierre
-                    if ft.net_fr_after_fees <= 0:
-                        logger.debug(
-                            "SCAN SKIP %s | FR %.4f%% no cubre fee de cierre 0.06%%",
-                            symbol, ft.funding_rate * 100,
-                        )
-                        return
-
-                    # Gate 6: predicted funding sanity check
-                    if config.USE_PREDICTED_FUNDING_CHECK:
-                        # Si el predicted ya es positivo o menos negativo que umbral,
-                        # la tesis se debilita para el siguiente ciclo
-                        if ft.next_funding_rate > config.MAX_FUNDING_RATE * 0.5:
-                            logger.debug(
-                                "SCAN SKIP %s | Next FR %.4f%% no es lo suficientemente negativo.",
-                                symbol, ft.next_funding_rate * 100,
-                            )
-                            return
-
-                    # Gate 7: spread
-                    spread_ok = await self._check_spread(symbol)
-                    if not spread_ok:
-                        return
 
                     # ── Microestructura ─────────────────────────────────
                     ticker = tickers.get(symbol, {})
@@ -1693,6 +1711,7 @@ class TradingEngine:
             if state.total_margin_used == 0.0
             and state.last_order_ts < now - stale_cutoff
             and len(state.oi_history) == 0
+            and len(state.fr_history) < 10  # preservar si acumuló histórico útil para math gates
         ]
         for sym in to_delete:
             del self.states[sym]

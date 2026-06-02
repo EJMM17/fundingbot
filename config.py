@@ -283,6 +283,8 @@ EVT_THRESHOLD_PCT: float = 0.90         # Percentil para umbral POT (90% = top 1
 ENABLE_TAIL_GATES: bool = True          # Gate de cola pesada
 TAIL_ALPHA_MIN_ENTRY: float = 2.5       # α mínima para entrar (α < 2.5 = cola catastrófica)
 TAIL_ALPHA_WARNING: float = 3.0         # α de advertencia
+TAIL_RISK_MAX_ENTRY: float = 0.75       # Índice de riesgo de cola máximo para entrar
+                                        # (0 = colas ligeras, 1 = colas catastróficas)
 
 # Hurst / Persistencia
 ENABLE_HURST_FILTER: bool = True
@@ -292,7 +294,9 @@ HURST_CALCULATION_METHOD: str = "dfa"   # "rs" o "dfa" (DFA recomendado)
 
 # Entropía / Teoría de la Información
 ENABLE_ENTROPY_GATES: bool = True
-ENTROPY_MAX_ENTRY: float = 0.75         # Entropía normalizada máxima para entrar
+ENTROPY_MAX_ENTRY: float = 0.85         # Entropía normalizada máxima para entrar.
+                                        # 0.75 era demasiado restrictivo para altcoins
+                                        # con FR que fluctúa legítimamente (rango real ~0.75–0.85)
 ENTROPY_MIN_BONUS: float = 0.40         # Entropía para bonus de predictibilidad
 TE_MIN_FOR_OI_WEIGHT: float = 0.01      # Transfer entropy mínimo para confiar en OI
 
@@ -304,7 +308,9 @@ LOG_VOL_CALM_PERCENTILE: float = 0.25
 # Multifractalidad
 ENABLE_MULTIFRACTAL_GATES: bool = True
 MULTIFRACTAL_WIDTH_THRESHOLD: float = 0.50  # Δα umbral para penalización
-MULTIFRACTAL_WIDTH_ABORT: float = 0.70      # Δα para abortar entrada
+MULTIFRACTAL_WIDTH_ABORT: float = 0.80      # Δα para abortar entrada.
+                                            # 0.70 era demasiado estricto para altcoins
+                                            # de menor cap que tienen espectros más anchos
 
 # Scoring
 ENABLE_MATH_SCORING: bool = True        # Reemplazar scoring simple por power_score
